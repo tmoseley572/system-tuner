@@ -5,11 +5,12 @@ Apache Smart Tuner is a Bash-based capacity planner for Apache HTTP Server that 
 ## What it does
 - **Resource- and PHP-aware tuning:** Uses total RAM, CPU cores, observed httpd RSS, and PHP-friendly CPU caps to calculate safe concurrency limits per MPM.
 - **Tiered profiles:** LOW, LOW-MID, MID, MID-HIGH, and HIGH profiles automatically cap ServerLimit/MaxRequestWorkers (or threads) for a wide range of footprints.
-- **Cautious floors and caps:** Enforces sensible minimums (128 workers/threads) while honoring tier ceilings (128/256/1024/2048/4096 by tier) to avoid runaway prefork deployments.
+- **Cautious floors and caps:** Enforces sensible minimums (128 threads for event/worker; 128 prefork workers only when the RAM budget can hold them, never below 16) while honoring tier ceilings (128/256/1024/2048/4096 by tier) to avoid runaway prefork deployments.
 - **Clear visibility:** Prints current versus proposed settings, emits an annotated config block, and now supports machine-readable JSON output for automation.
 - **Log health scan:** Reviews the last 24 hours of Apache error logs (or the entire file if newer) for worker saturation, ServerLimit warnings, common crash/timeout patterns, and restart frequency with checklist-style output.
 - **Safe application path:** Creates timestamped backups, scrubs legacy MPM blocks, validates with `configtest`, and reloads (or optionally skips reload) only after a clean validation.
 - **cPanel/WHM integration:** Prefers `pre_virtualhost_global.conf` when present, falls back to `pre_main_global.conf`, and triggers `/scripts/rebuildhttpdconf` when applying changes.
+- **Stack-aware RAM plan:** Detects PHP-FPM pools and a local MySQL/MariaDB, fits Apache, PHP-FPM and MySQL into one RAM budget, and recommends `pm.max_children`, `innodb_buffer_pool_size` and `max_connections`. These are recommend-only, and Apache remains the only thing applied.
 - **Operator control:** Override the RAM budget percentage when you need a custom envelope and redirect or disable on-disk logging per run.
 
 ## Usage
@@ -26,7 +27,7 @@ chmod +x apache-tuner
 
 ### Flags
 ```
-./apache-tuner [--analyze] [--locate] [--apply] [--json] [--batch] [--export <path>] [--no-reload] [--mpm <type>] [--budget <0.x>] [--log-file <path|none>] [--version]
+./apache-tuner [--analyze] [--locate] [--apply] [--json] [--batch] [--export <path>] [--no-reload] [--mpm <type>] [--budget <0.x>] [--mysql-share <0.x>] [--no-stack] [--log-file <path|none>] [--version]
 ```
 - `--json`: Return analysis/apply details as JSON (for monitoring/CM pipelines). Not supported with locate mode.
 - `--batch`: Emit analysis/apply details as a single-line bash-friendly `key=value` string for fleet-wide collection.
@@ -36,6 +37,8 @@ chmod +x apache-tuner
 - `--version`: Print the current Apache Smart Tuner release.
 - `--budget`: Override the tier-derived Apache RAM budget with a decimal percentage (e.g., `0.40`).
 - `--log-file`: Send tuner logs to a custom file or `none` to disable filesystem logging.
+- `--mysql-share`: Override the share of RAM planned for a local MySQL/MariaDB (default 0.15–0.30 by tier).
+- `--no-stack`: Skip PHP-FPM/MySQL detection and size Apache from the tier budget alone (pre-1.22 behaviour).
 
 ### Examples
 Run a standard analysis:
@@ -193,6 +196,46 @@ JSON output mirrors the same data structure for pipelines:
 }
 ```
 
+## PHP-FPM and MySQL/MariaDB awareness (1.22)
+Apache rarely has the box to itself. Since 1.22 the tuner plans one shared RAM budget across the whole web stack. The PHP-FPM and MySQL/MariaDB parts are **recommend-only**: `--apply` still writes only the Apache block, and nothing else is edited or restarted.
+
+**Memory plan.** Total RAM is split in this order:
+1. **OS / page cache reserve.** 10–15% of RAM by tier, clamped to 512–4096 MB.
+2. **MySQL/MariaDB.** When it runs locally, the reserve is the larger of its current RSS and the footprint it would need with the recommended settings.
+3. **Apache.** The tier percentage is now a *ceiling*. When PHP-FPM is running and `mod_php` is not loaded, httpd children no longer carry PHP, so Apache gets 30% of the remaining web budget and PHP-FPM gets the rest. The Apache budget is only ever lowered, never raised. When that happens the source is reported as `shared-plan`.
+4. **PHP-FPM.** Gets what is left after Apache's worst case, divided by the measured average worker size.
+
+**PHP-FPM detection.**
+- Running masters and pool workers are found from php-fpm process titles.
+- Pool files are read from cPanel EA4 (`/opt/cpanel/ea-php*/root/etc/php-fpm.d`), RHEL/Remi, Debian and `/usr/local/etc` paths. The tuner counts pools, `pm` modes, the sum of `pm.max_children`, and pools without `pm.max_requests`.
+- Worker size uses PSS when readable (so OPcache is not counted once per worker), otherwise RSS, with a 32 MB floor.
+- Recent FPM error logs are scanned for `server reached pm.max_children` warnings per pool.
+- Apache's loaded PHP modules (`mod_php`, `proxy_fcgi`, `suphp`, `lsapi`, `ruid2`) and cPanel's per-version handler map are reported.
+
+**PHP-FPM recommendations.**
+- A per-pool `pm.max_children`. When most pools are `ondemand`, idle sites hold no workers, so 3x overcommit across pools is allowed. Otherwise no overcommit is allowed.
+- Warnings for pools that alone can exceed the FPM budget, pools hitting their limit in the logs, workers that never recycle, and many-pool servers still on `dynamic`/`static`.
+- On cPanel the advice points to WHM's *System PHP-FPM Settings* (`pm_max_children` in `/var/cpanel/ApachePHPFPM/system_pool_defaults.yaml`), then `/scripts/php_fpm_config --rebuild`.
+
+**MySQL/MariaDB.**
+- Live variables are read with `mysql`, using root's `~/.my.cnf` on cPanel. When that is unavailable the tuner falls back to `my_print_defaults` plus server defaults.
+- InnoDB data size is read from `information_schema`, bounded server-side to 10 seconds (`max_statement_time` / `MAX_EXECUTION_TIME`).
+- The planned MySQL share of RAM is 15/20/25/25/30% by tier. Override it with `--mysql-share`.
+- Recommendations:
+  - `innodb_buffer_pool_size` fitted to that share, and capped at InnoDB data + 25%.
+  - `max_connections`, raised when `Max_used_connections` reaches 90% of it, or lowered when the worst case would blow the plan.
+  - Disabling the query cache.
+  - Aligning `tmp_table_size` with `max_heap_table_size`.
+  - A warning when stats cover less than 24 hours of uptime.
+
+The text report prints the memory plan, a PHP-FPM section, a MySQL section with a suggested `[mysqld]` snippet, and a list of stack recommendations. JSON adds `memory_plan`, `php_fpm`, `mysql` and `stack_recommendations`. Batch adds `fpm_*`, `mysql_*` and plan fields.
+
+Additional flags:
+- `--mysql-share <0.x>`: share of RAM planned for MySQL/MariaDB (default 0.15–0.30 by tier).
+- `--no-stack`: skip PHP-FPM/MySQL detection and use the tier Apache budget alone (pre-1.22 behaviour).
+
+Run as root for PSS measurements and live MySQL variables.
+
 ## ServerLimit buffer and "scoreboard full" protection
 Apache keeps old children alive long enough to finish in-flight requests during graceful restarts or MaxConnectionsPerChild recycling. If ServerLimit is set to the exact active process count, those lingering children can temporarily exhaust the scoreboard and block Apache from spawning the replacements, resulting in brief "Scoreboard is full" errors and dropped requests. Apache Smart Tuner pads ServerLimit by a small buffer (5% with an 8-slot minimum) above the calculated MaxRequestWorkers/process count so new workers can come online while old ones drain, without raising steady-state concurrency.
 
@@ -203,7 +246,7 @@ Apache keeps old children alive long enough to finish in-flight requests during 
 - **Reload control:** When Apache is running, the tuner reloads automatically unless `--no-reload` is set; if Apache is stopped, it writes the config and logs the pending start.
 
 ## Versioning
-The project follows semantic versioning. The current release is **1.20.0**.
+The project follows semantic versioning. The current release is **1.22.0**.
 
 ## License
 GPL-3.0-or-later. Authored by **Ryan MacDonald <ryan@rfxn.com>**.

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Apache Smart Tuner v1.20.0 for cPanel / WHM & generic Apache
+# Apache Smart Tuner v1.22.0 for cPanel / WHM & generic Apache
 # Author: Ryan MacDonald <ryan@rfxn.com>
 # License: GPL-3.0-or-later
 #
@@ -28,12 +28,16 @@
 # - --locate: list only conf files defining MPM / concurrency settings
 # - --apply: removes legacy prefork/worker/event/mpm_* IfModule blocks in target include,
 #            then writes a single Smart Tuner block for the active MPM
+# - Stack-aware (1.22): detects PHP-FPM pools and a local MySQL/MariaDB, plans one
+#   shared RAM budget (OS reserve + MySQL + Apache + PHP-FPM), lowers the Apache
+#   budget only when the tier share would not fit, and prints PHP-FPM / MySQL
+#   recommendations. Those are never applied; --no-stack restores the old behaviour.
 # ==============================================================================
 
 set -u   # keep "undefined var" safety; avoid -e/pipefail to prevent silent exits
 
 VERSION_MAJOR=1
-VERSION_MINOR=21
+VERSION_MINOR=22
 VERSION_PATCH=0
 VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
 VERSION_NAME="Apache Smart Tuner v${VERSION}"
@@ -90,6 +94,75 @@ LOG_REVIEW_KEYS=(segfaults timeouts denied)
 # Initialize per-run counts
 declare -A COMMON_ERROR_COUNTS=()
 
+# Stack awareness (PHP-FPM + local MySQL/MariaDB). Recommend-only: nothing
+# outside Apache is ever written or restarted by this script.
+STACK_ENABLED=1
+MYSQL_SHARE_OVERRIDE=""
+FPM_DEFAULT_WORKER_MB=64
+FPM_MIN_WORKER_MB=32
+APACHE_WEB_SHARE_WITH_FPM="0.30"
+FPM_LOG_TAIL_LINES=20000
+STACK_RECS=()
+PHP_HANDLERS=()
+CPANEL_PHP_HANDLERS=""
+FPM_POOL_NAMES=()
+FPM_POOL_MAX=()
+declare -A FPM_POOL_HITS=()
+declare -A MYV=()
+
+# Plan/FPM/MySQL outputs (initialized so set -u is safe with --no-stack)
+OS_RESERVE_MB=0
+OS_RESERVE_PCT=0
+MYSQL_SHARE=0
+MYSQL_SHARE_SOURCE="tier"
+MYSQL_RESERVE_MB=0
+WEB_BUDGET_MB=0
+APACHE_TIER_BUDGET_MB=0
+APACHE_WEB_SHARE="1.00"
+APACHE_USED_MB=0
+PLAN_OVERCOMMIT_MB=0
+FPM_STATUS="not_checked"
+FPM_ACTIVE=0
+FPM_MASTERS=0
+FPM_WORKERS_NOW=0
+FPM_AVG_MB=0
+FPM_MEM_METHOD="none"
+FPM_POOL_COUNT=0
+FPM_SUM_MAX_CHILDREN=0
+FPM_TYPICAL_MAX_CHILDREN=0
+FPM_MODE_ONDEMAND=0
+FPM_MODE_DYNAMIC=0
+FPM_MODE_STATIC=0
+FPM_NO_MAX_REQUESTS=0
+FPM_LOG_FILES_SCANNED=0
+FPM_LOG_HITS=0
+FPM_BUDGET_MB=0
+FPM_CAPACITY=0
+FPM_OVERCOMMIT=1
+FPM_REC_MAX_CHILDREN=0
+MYSQL_STATUS="not_checked"
+MYSQL_RUNNING=0
+MYSQL_RSS_MB=0
+MYSQL_VARS_SOURCE="none"
+MYSQL_VERSION="unknown"
+MYSQL_FLAVOR="mysql"
+MYSQL_INNODB_DATA_MB=0
+MYSQL_BP_MB=0
+MYSQL_REC_BP_MB=0
+MYSQL_MAX_CONN=0
+MYSQL_REC_MAX_CONN=0
+MYSQL_MAX_USED=""
+MYSQL_UPTIME=""
+MYSQL_PER_THREAD_KB=0
+MYSQL_OTHER_MB=0
+MYSQL_PEAK_MB=0
+MYSQL_REC_PEAK_MB=0
+MYSQL_TARGET_MB=0
+MYSQL_REC_FOOTPRINT_MB=0
+MYSQL_QUERY_CACHE_ON=0
+MYSQL_TMP_MB=0
+MYSQL_HEAP_MB=0
+
 set_mode() {
     local NEW_MODE="$1"
 
@@ -104,7 +177,7 @@ set_mode() {
 
 usage() {
     cat <<EOF
-Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--batch] [--export <path>] [--no-reload] [--mpm <type>] [--budget <0.x>] [--log-file <path|none>]
+Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--batch] [--export <path>] [--no-reload] [--mpm <type>] [--budget <0.x>] [--mysql-share <0.x>] [--no-stack] [--log-file <path|none>]
 
   --analyze           (default) Print recommended Apache MPM config based on current RAM/cores
   --locate            Show which Apache config files currently define MPM-related directives
@@ -117,9 +190,13 @@ Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--batch] [--exp
   --budget <0.x>      Override tier-based Apache RAM budget percentage (0.05-0.95)
   --log-file <path>   Write logs to the given file (default: /var/log/apache-smart-tuner.log)
                       Use "none" to disable filesystem logging
+  --mysql-share <0.x> Override the tier-based share of RAM planned for local MySQL/MariaDB (0.05-0.95)
+  --no-stack          Skip PHP-FPM/MySQL detection and use the tier Apache budget alone (pre-1.22 behaviour)
   --version           Display the current Apache Smart Tuner version and exit
 
 Notes:
+  - PHP-FPM and MySQL/MariaDB settings are recommendations only; --apply changes Apache only
+  - Run as root for full PHP-FPM memory (PSS) and MySQL variable access
   - --apply must be run as root
   - On cPanel systems, the config will be written to the standard include locations
   - Backup files are created with .bk-YYYYmmddHHMMSS suffix
@@ -234,6 +311,23 @@ parse_cli_arguments() {
                             exit 1
                         fi
                         BUDGET_OVERRIDE="$budget_value"
+                        ;;
+                    no-stack)
+                        STACK_ENABLED=0
+                        ;;
+                    mysql-share|mysql-share=*)
+                        local share_value
+                        if [[ "$OPTARG" == mysql-share=* ]]; then
+                            share_value="${OPTARG#*=}"
+                        else
+                            share_value="${!OPTIND:-}"
+                            OPTIND=$((OPTIND + 1))
+                        fi
+                        if [[ -z "$share_value" || "$share_value" == -* ]] || ! validate_budget_pct "$share_value"; then
+                            echo "ERROR: --mysql-share must be between 0.05 and 0.95 (e.g., 0.25)"
+                            exit 1
+                        fi
+                        MYSQL_SHARE_OVERRIDE="$share_value"
                         ;;
                     log-file)
                         local log_path="${!OPTIND:-}"
@@ -945,6 +1039,903 @@ measure_apache_procs() {
     APACHE_BUDGET_MB=$(echo "$TOTAL_MEM * $APACHE_PCT" | bc | awk '{printf "%.0f", $0}')
 }
 
+# ----------------- PHP-FPM / MySQL stack awareness -----------------
+#
+# The tier Apache budget is a fixed share of RAM. When PHP-FPM pools and a local
+# MySQL/MariaDB share the box, all three must fit in the same RAM. These helpers
+# measure both, size recommendations for them (never applied), and lower the
+# Apache budget only when the tier share would not fit alongside them.
+
+# Convert a MySQL-style size (bytes, or 512K / 128M / 1G / 1T) to bytes.
+size_to_bytes() {
+    local v="${1:-}"
+    v="${v,,}"
+    v="${v//[[:space:]]/}"
+    case "$v" in
+        *[0-9]k) awk -v n="${v%k}" 'BEGIN { printf "%.0f", n * 1024 }' ;;
+        *[0-9]m) awk -v n="${v%m}" 'BEGIN { printf "%.0f", n * 1048576 }' ;;
+        *[0-9]g) awk -v n="${v%g}" 'BEGIN { printf "%.0f", n * 1073741824 }' ;;
+        *[0-9]t) awk -v n="${v%t}" 'BEGIN { printf "%.0f", n * 1099511627776 }' ;;
+        ''|*[!0-9.]*) echo 0 ;;
+        *) awk -v n="$v" 'BEGIN { printf "%.0f", n }' ;;
+    esac
+}
+
+bytes_to_mb() {
+    awk -v b="${1:-0}" 'BEGIN { printf "%.0f", b / 1048576 }'
+}
+
+pct_of_total_mb() {
+    awk -v t="$TOTAL_MEM" -v p="$1" 'BEGIN { printf "%.0f", t * p }'
+}
+
+run_with_timeout() {
+    local secs="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
+json_escape() {
+    local v
+    v=$(sanitize_value "${1:-}")
+    v=${v//\\/\\\\}
+    v=${v//\"/\\\"}
+    printf '%s' "$v"
+}
+
+add_stack_rec() {
+    STACK_RECS+=("$1")
+}
+
+# Average memory per process for a list of PIDs. Uses PSS (shared pages such as
+# OPcache split across workers) when every PID is readable, else falls back to RSS.
+# Sets MEASURE_AVG_MB, MEASURE_COUNT, MEASURE_METHOD.
+measure_pids_avg_mb() {
+    MEASURE_AVG_MB=0
+    MEASURE_COUNT=0
+    MEASURE_METHOD="pss"
+
+    local pid kb total_kb=0 count=0
+    for pid in "$@"; do
+        [[ -e "/proc/$pid" ]] || continue
+        kb=""
+        if [[ -r "/proc/$pid/smaps_rollup" ]]; then
+            kb=$(awk '/^Pss:/ {print $2; exit}' "/proc/$pid/smaps_rollup" 2>/dev/null)
+        fi
+        if [[ ! "$kb" =~ ^[0-9]+$ ]]; then
+            MEASURE_METHOD="rss"
+            break
+        fi
+        total_kb=$((total_kb + kb))
+        count=$((count + 1))
+    done
+
+    if [[ "$MEASURE_METHOD" == "rss" ]]; then
+        total_kb=0
+        count=0
+        for pid in "$@"; do
+            kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+            [[ "$kb" =~ ^[0-9]+$ ]] || continue
+            total_kb=$((total_kb + kb))
+            count=$((count + 1))
+        done
+    fi
+
+    MEASURE_COUNT=$count
+    if (( count > 0 )); then
+        MEASURE_AVG_MB=$(( (total_kb / count + 1023) / 1024 ))
+    fi
+}
+
+set_stack_shares() {
+    local default_share
+    case "$TIER" in
+        LOW)      default_share="0.15"; OS_RESERVE_PCT="0.15" ;;
+        LOW-MID)  default_share="0.20"; OS_RESERVE_PCT="0.12" ;;
+        MID)      default_share="0.25"; OS_RESERVE_PCT="0.10" ;;
+        MID-HIGH) default_share="0.25"; OS_RESERVE_PCT="0.10" ;;
+        *)        default_share="0.30"; OS_RESERVE_PCT="0.10" ;;
+    esac
+
+    if [[ -n "$MYSQL_SHARE_OVERRIDE" ]]; then
+        MYSQL_SHARE="$MYSQL_SHARE_OVERRIDE"
+        MYSQL_SHARE_SOURCE="override"
+    else
+        MYSQL_SHARE="$default_share"
+        MYSQL_SHARE_SOURCE="tier"
+    fi
+
+    OS_RESERVE_MB=$(pct_of_total_mb "$OS_RESERVE_PCT")
+    (( OS_RESERVE_MB < 512 )) && OS_RESERVE_MB=512
+    (( OS_RESERVE_MB > 4096 )) && OS_RESERVE_MB=4096
+}
+
+has_php_handler() {
+    local want="$1" h
+    (( ${#PHP_HANDLERS[@]} > 0 )) || return 1
+    for h in "${PHP_HANDLERS[@]}"; do
+        [[ "$h" == "$want" ]] && return 0
+    done
+    return 1
+}
+
+# Which PHP handlers Apache can use (from loaded modules), plus cPanel's
+# per-version handler map. Domains on PHP-FPM are found via pool files below.
+detect_php_handlers() {
+    PHP_HANDLERS=()
+    CPANEL_PHP_HANDLERS=""
+
+    local mods="" bin
+    [[ ${#APACHE_BINARIES[@]} -eq 0 ]] && discover_apache_binaries
+    if (( ${#APACHE_BINARIES[@]} > 0 )); then
+        for bin in "${APACHE_BINARIES[@]}"; do
+            mods=$("$bin" -M 2>/dev/null || true)
+            [[ -n "$mods" ]] && break
+        done
+    fi
+
+    grep -Eq '^[[:space:]]*php[0-9]*_module' <<<"$mods" && PHP_HANDLERS+=("mod_php")
+    grep -q 'proxy_fcgi_module' <<<"$mods" && PHP_HANDLERS+=("proxy_fcgi")
+    grep -q 'suphp_module' <<<"$mods" && PHP_HANDLERS+=("suphp")
+    grep -q 'lsapi_module' <<<"$mods" && PHP_HANDLERS+=("lsapi")
+    grep -q 'ruid2_module' <<<"$mods" && PHP_HANDLERS+=("ruid2")
+
+    if [[ "${IS_CPANEL:-0}" -eq 1 && -r /etc/cpanel/ea4/php.conf ]]; then
+        CPANEL_PHP_HANDLERS=$(awk -F': *' '/^ea-php[0-9]+:/ { gsub(/[[:space:]]/, "", $2); printf "%s%s=%s", sep, $1, $2; sep="," }' /etc/cpanel/ea4/php.conf)
+    fi
+}
+
+fpm_pool_files() {
+    local -a globs=()
+    if [[ -n "${SMART_TUNER_FPM_POOL_GLOBS:-}" ]]; then
+        read -r -a globs <<<"$SMART_TUNER_FPM_POOL_GLOBS"
+    else
+        globs=(
+            "/opt/cpanel/ea-php*/root/etc/php-fpm.d/*.conf"
+            "/etc/php-fpm.d/*.conf"
+            "/etc/opt/remi/php*/php-fpm.d/*.conf"
+            "/etc/php/*/fpm/pool.d/*.conf"
+            "/usr/local/etc/php-fpm.d/*.conf"
+        )
+    fi
+
+    local g f restore_nullglob
+    restore_nullglob=$(shopt -p nullglob)
+    shopt -s nullglob
+    for g in "${globs[@]}"; do
+        # shellcheck disable=SC2206  # intentional glob expansion
+        for f in $g; do
+            [[ -f "$f" ]] && printf '%s\n' "$f"
+        done
+    done
+    eval "$restore_nullglob"
+}
+
+fpm_log_files() {
+    local -a globs=()
+    if [[ -n "${SMART_TUNER_FPM_LOG_GLOBS:-}" ]]; then
+        read -r -a globs <<<"$SMART_TUNER_FPM_LOG_GLOBS"
+    else
+        globs=(
+            "/opt/cpanel/ea-php*/root/usr/var/log/php-fpm/error.log"
+            "/var/log/php-fpm/error.log"
+            "/var/log/php*-fpm.log"
+            "/var/opt/remi/php*/log/php-fpm/error.log"
+        )
+    fi
+
+    local g f restore_nullglob
+    restore_nullglob=$(shopt -p nullglob)
+    shopt -s nullglob
+    for g in "${globs[@]}"; do
+        # shellcheck disable=SC2206
+        for f in $g; do
+            [[ -r "$f" ]] && printf '%s\n' "$f"
+        done
+    done
+    eval "$restore_nullglob"
+}
+
+detect_phpfpm() {
+    FPM_STATUS="not_detected"
+    FPM_ACTIVE=0
+    FPM_MASTERS=0
+    FPM_WORKERS_NOW=0
+    FPM_AVG_MB=0
+    FPM_MEM_METHOD="none"
+    FPM_POOL_COUNT=0
+    FPM_SUM_MAX_CHILDREN=0
+    FPM_TYPICAL_MAX_CHILDREN=0
+    FPM_MODE_ONDEMAND=0
+    FPM_MODE_DYNAMIC=0
+    FPM_MODE_STATIC=0
+    FPM_NO_MAX_REQUESTS=0
+    FPM_LOG_FILES_SCANNED=0
+    FPM_LOG_HITS=0
+    FPM_POOL_NAMES=()
+    FPM_POOL_MAX=()
+    FPM_POOL_HITS=()
+
+    # Running masters and pool workers (process titles set by php-fpm itself)
+    local -a worker_pids=()
+    local pid args
+    while read -r pid args; do
+        case "$args" in
+            "php-fpm: master process"*) FPM_MASTERS=$((FPM_MASTERS + 1)) ;;
+            "php-fpm: pool "*) worker_pids+=("$pid") ;;
+        esac
+    done < <(ps -eo pid=,args= 2>/dev/null)
+    FPM_WORKERS_NOW=${#worker_pids[@]}
+
+    # Pool definitions
+    local -a files=()
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && files+=("$f")
+    done < <(fpm_pool_files)
+
+    if (( ${#files[@]} > 0 )); then
+        local name pm mc mr
+        declare -A mc_freq=()
+        while IFS='|' read -r name pm mc mr; do
+            [[ -z "$name" ]] && continue
+            FPM_POOL_COUNT=$((FPM_POOL_COUNT + 1))
+            FPM_POOL_NAMES+=("$name")
+            [[ "$mc" =~ ^[0-9]+$ ]] || mc=0
+            FPM_POOL_MAX+=("$mc")
+            FPM_SUM_MAX_CHILDREN=$((FPM_SUM_MAX_CHILDREN + mc))
+            (( mc > 0 )) && mc_freq[$mc]=$(( ${mc_freq[$mc]:-0} + 1 ))
+            case "${pm,,}" in
+                ondemand) FPM_MODE_ONDEMAND=$((FPM_MODE_ONDEMAND + 1)) ;;
+                static)   FPM_MODE_STATIC=$((FPM_MODE_STATIC + 1)) ;;
+                *)        FPM_MODE_DYNAMIC=$((FPM_MODE_DYNAMIC + 1)) ;;
+            esac
+            [[ "$mr" =~ ^[0-9]+$ && "$mr" -gt 0 ]] || FPM_NO_MAX_REQUESTS=$((FPM_NO_MAX_REQUESTS + 1))
+        done < <(awk '
+            function flush() {
+                if (name != "" && tolower(name) != "global") printf "%s|%s|%s|%s\n", name, pm, mc, mr
+                name = ""
+            }
+            FNR == 1 { flush() }
+            /^[[:space:]]*[;#]/ { next }
+            /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+                flush()
+                s = $0
+                gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", s)
+                name = s; pm = "dynamic"; mc = ""; mr = "0"
+                next
+            }
+            name != "" && index($0, "=") > 0 {
+                key = $0; sub(/=.*/, "", key); gsub(/[[:space:]]/, "", key)
+                val = $0; sub(/^[^=]*=/, "", val); sub(/[;#].*$/, "", val)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", val); gsub(/["\047]/, "", val)
+                if (key == "pm") pm = val
+                else if (key == "pm.max_children") mc = val
+                else if (key == "pm.max_requests") mr = val
+            }
+            END { flush() }
+        ' "${files[@]}" 2>/dev/null)
+
+        local best_count=0 v
+        if (( ${#mc_freq[@]} > 0 )); then
+            for v in "${!mc_freq[@]}"; do
+                if (( mc_freq[$v] > best_count )); then
+                    best_count=${mc_freq[$v]}
+                    FPM_TYPICAL_MAX_CHILDREN=$v
+                fi
+            done
+        fi
+    fi
+
+    if (( FPM_MASTERS > 0 )); then
+        FPM_STATUS="running"
+        FPM_ACTIVE=1
+    elif (( FPM_POOL_COUNT > 0 )); then
+        FPM_STATUS="configured_not_running"
+    fi
+
+    # Average worker footprint (sample up to 300 workers)
+    if (( FPM_WORKERS_NOW > 0 )); then
+        measure_pids_avg_mb "${worker_pids[@]:0:300}"
+        if (( MEASURE_COUNT > 0 )); then
+            FPM_AVG_MB=$MEASURE_AVG_MB
+            FPM_MEM_METHOD=$MEASURE_METHOD
+        fi
+    fi
+    if (( FPM_AVG_MB <= 0 )); then
+        FPM_AVG_MB=$FPM_DEFAULT_WORKER_MB
+        FPM_MEM_METHOD="default"
+    elif (( FPM_AVG_MB < FPM_MIN_WORKER_MB )); then
+        # Idle pre-forked workers understate a busy PHP request
+        FPM_AVG_MB=$FPM_MIN_WORKER_MB
+        FPM_MEM_METHOD="${FPM_MEM_METHOD}+floor"
+    fi
+
+    # "server reached pm.max_children" warnings in recent FPM error log lines
+    local logf pool
+    while IFS= read -r logf; do
+        [[ -z "$logf" ]] && continue
+        FPM_LOG_FILES_SCANNED=$((FPM_LOG_FILES_SCANNED + 1))
+        while IFS= read -r pool; do
+            [[ -z "$pool" ]] && continue
+            FPM_POOL_HITS[$pool]=$(( ${FPM_POOL_HITS[$pool]:-0} + 1 ))
+            FPM_LOG_HITS=$((FPM_LOG_HITS + 1))
+        done < <(tail -n "$FPM_LOG_TAIL_LINES" "$logf" 2>/dev/null \
+                    | grep -E 'reached (pm\.)?max_children' \
+                    | sed -nE 's/.*\[pool ([^]]+)\].*/\1/p')
+    done < <(fpm_log_files)
+}
+
+mysql_var_bytes() {
+    local key="$1" def="$2"
+    size_to_bytes "${MYV[$key]:-$def}"
+}
+
+detect_mysql() {
+    MYSQL_STATUS="absent"
+    MYSQL_RUNNING=0
+    MYSQL_RSS_MB=0
+    MYSQL_VARS_SOURCE="none"
+    MYSQL_VERSION="unknown"
+    MYSQL_FLAVOR="mysql"
+    MYSQL_INNODB_DATA_MB=0
+    MYV=()
+
+    local name kb rss_kb=0
+    for name in mariadbd mysqld; do
+        kb=$(ps -C "$name" -o rss= 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')
+        [[ "$kb" =~ ^[0-9]+$ ]] && rss_kb=$((rss_kb + kb))
+    done
+    MYSQL_RSS_MB=$((rss_kb / 1024))
+
+    if (( rss_kb == 0 )); then
+        if command -v mysqld >/dev/null 2>&1 || command -v mariadbd >/dev/null 2>&1; then
+            MYSQL_STATUS="installed_not_running"
+        fi
+        return
+    fi
+    MYSQL_RUNNING=1
+    MYSQL_STATUS="running"
+
+    local out="" k v line
+    if command -v mysql >/dev/null 2>&1; then
+        out=$(run_with_timeout 10 mysql --batch --skip-column-names --connect-timeout=5 \
+                -e "SHOW GLOBAL VARIABLES; SHOW GLOBAL STATUS WHERE Variable_name IN ('Max_used_connections','Uptime')" \
+                </dev/null 2>/dev/null || true)
+    fi
+
+    if [[ -n "$out" ]]; then
+        MYSQL_VARS_SOURCE="live"
+        while IFS=$'\t' read -r k v; do
+            [[ -n "$k" ]] && MYV[$k]="$v"
+        done <<<"$out"
+    elif command -v my_print_defaults >/dev/null 2>&1; then
+        out=$(my_print_defaults mysqld server mariadb 2>/dev/null || true)
+        if [[ -n "$out" ]]; then
+            MYSQL_VARS_SOURCE="config"
+            while IFS= read -r line; do
+                line=${line#--}
+                [[ "$line" == *=* ]] || continue
+                k=${line%%=*}
+                v=${line#*=}
+                MYV[${k//-/_}]="$v"
+            done <<<"$out"
+        fi
+    fi
+
+    if [[ "$MYSQL_VARS_SOURCE" == "none" ]]; then
+        MYSQL_STATUS="running_no_access"
+        return
+    fi
+
+    MYSQL_VERSION="${MYV[version]:-unknown}"
+    if [[ "${MYV[version]:-}${MYV[version_comment]:-}" == *[Mm]aria[Dd][Bb]* ]]; then
+        MYSQL_FLAVOR="mariadb"
+    fi
+
+    # InnoDB data+index size caps a useful buffer pool. Bounded server-side so a
+    # host with many tables cannot be loaded down by information_schema.
+    if [[ "$MYSQL_VARS_SOURCE" == "live" ]]; then
+        local q="SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables WHERE engine = 'InnoDB'"
+        if [[ "$MYSQL_FLAVOR" == "mariadb" ]]; then
+            q="SET STATEMENT max_statement_time=10 FOR $q"
+        else
+            q="SELECT /*+ MAX_EXECUTION_TIME(10000) */ ${q#SELECT }"
+        fi
+        local size
+        size=$(run_with_timeout 15 mysql --batch --skip-column-names --connect-timeout=5 -e "$q" </dev/null 2>/dev/null | tail -n 1)
+        [[ "$size" =~ ^[0-9]+$ ]] && MYSQL_INNODB_DATA_MB=$(bytes_to_mb "$size")
+    fi
+}
+
+recommend_mysql() {
+    MYSQL_BP_MB=0
+    MYSQL_REC_BP_MB=0
+    MYSQL_MAX_CONN=0
+    MYSQL_REC_MAX_CONN=0
+    MYSQL_MAX_USED=""
+    MYSQL_UPTIME=""
+    MYSQL_PEAK_MB=0
+    MYSQL_REC_PEAK_MB=0
+    MYSQL_REC_FOOTPRINT_MB=0
+    MYSQL_TARGET_MB=$(pct_of_total_mb "$MYSQL_SHARE")
+
+    [[ "$MYSQL_RUNNING" -eq 1 && "$MYSQL_VARS_SOURCE" != "none" ]] || return
+
+    local MB=1048576
+    local bp_b key_b tmp_b heap_b logbuf_b qc_b aria_b
+    bp_b=$(mysql_var_bytes innodb_buffer_pool_size 134217728)
+    key_b=$(mysql_var_bytes key_buffer_size 8388608)
+    tmp_b=$(mysql_var_bytes tmp_table_size 16777216)
+    heap_b=$(mysql_var_bytes max_heap_table_size 16777216)
+    logbuf_b=$(mysql_var_bytes innodb_log_buffer_size 16777216)
+    qc_b=$(mysql_var_bytes query_cache_size 0)
+    aria_b=$(mysql_var_bytes aria_pagecache_buffer_size 0)
+
+    local sort_b join_b read_b rnd_b stack_b binlog_b
+    sort_b=$(mysql_var_bytes sort_buffer_size 262144)
+    join_b=$(mysql_var_bytes join_buffer_size 262144)
+    read_b=$(mysql_var_bytes read_buffer_size 131072)
+    rnd_b=$(mysql_var_bytes read_rnd_buffer_size 262144)
+    stack_b=$(mysql_var_bytes thread_stack 262144)
+    binlog_b=$(mysql_var_bytes binlog_cache_size 32768)
+
+    local per_thread_b=$(( sort_b + join_b + read_b + rnd_b + stack_b + binlog_b ))
+    (( per_thread_b < 1 )) && per_thread_b=1
+    MYSQL_PER_THREAD_KB=$(( per_thread_b / 1024 ))
+
+    # In-memory temp tables are bounded by the smaller of the two settings
+    local tmp_eff_b=$(( tmp_b < heap_b ? tmp_b : heap_b ))
+    MYSQL_TMP_MB=$(bytes_to_mb "$tmp_b")
+    MYSQL_HEAP_MB=$(bytes_to_mb "$heap_b")
+    local other_b=$(( key_b + tmp_eff_b + logbuf_b + qc_b + aria_b ))
+    MYSQL_OTHER_MB=$(( (other_b + MB - 1) / MB ))
+    MYSQL_BP_MB=$(bytes_to_mb "$bp_b")
+
+    MYSQL_MAX_CONN="${MYV[max_connections]:-151}"
+    [[ "$MYSQL_MAX_CONN" =~ ^[0-9]+$ ]] || MYSQL_MAX_CONN=151
+    [[ "${MYV[Max_used_connections]:-}" =~ ^[0-9]+$ ]] && MYSQL_MAX_USED="${MYV[Max_used_connections]}"
+    [[ "${MYV[Uptime]:-}" =~ ^[0-9]+$ ]] && MYSQL_UPTIME="${MYV[Uptime]}"
+
+    MYSQL_PEAK_MB=$(( (bp_b + other_b + MYSQL_MAX_CONN * per_thread_b) / MB ))
+
+    # --- max_connections ---
+    local need=100
+    if [[ -n "$MYSQL_MAX_USED" ]]; then
+        need=$(( (MYSQL_MAX_USED * 3 + 1) / 2 ))
+        (( need < 100 )) && need=100
+    fi
+    MYSQL_REC_MAX_CONN=$MYSQL_MAX_CONN
+    if [[ -n "$MYSQL_MAX_USED" ]] && (( MYSQL_MAX_USED * 10 >= MYSQL_MAX_CONN * 9 )); then
+        MYSQL_REC_MAX_CONN=$need
+    fi
+
+    # Connections we expect to be live at once when sizing the pool
+    local conn_basis
+    if [[ -n "$MYSQL_MAX_USED" ]]; then
+        conn_basis=$(( (MYSQL_MAX_USED * 5 + 3) / 4 ))
+        (( conn_basis < 20 )) && conn_basis=20
+    else
+        conn_basis=$(( MYSQL_MAX_CONN < 100 ? MYSQL_MAX_CONN : 100 ))
+    fi
+    (( conn_basis > MYSQL_REC_MAX_CONN )) && conn_basis=$MYSQL_REC_MAX_CONN
+    local conn_mb=$(( (conn_basis * per_thread_b + MB - 1) / MB ))
+
+    # --- innodb_buffer_pool_size ---
+    local pool=$(( MYSQL_TARGET_MB - MYSQL_OTHER_MB - conn_mb ))
+    local pool_note="fits ${MYSQL_SHARE} of RAM (${MYSQL_TARGET_MB} MB) after other buffers and ~${conn_basis} connections"
+    if (( MYSQL_INNODB_DATA_MB > 0 )); then
+        local cap=$(( MYSQL_INNODB_DATA_MB * 5 / 4 ))
+        (( cap < 128 )) && cap=128
+        if (( pool > cap )); then
+            pool=$cap
+            pool_note="InnoDB data is ${MYSQL_INNODB_DATA_MB} MB; pool sized to data + 25%"
+        fi
+    fi
+    (( pool < 128 )) && pool=128
+    pool=$(( pool / 128 * 128 ))
+    (( pool < 128 )) && pool=128
+    local diff=$(( pool - MYSQL_BP_MB ))
+    (( diff < 0 )) && diff=$(( -diff ))
+    if (( diff * 10 <= MYSQL_BP_MB )); then
+        pool=$MYSQL_BP_MB
+    fi
+    MYSQL_REC_BP_MB=$pool
+
+    # Keep the worst case (every allowed connection busy) within share + 10% of RAM
+    local allowed=$(( MYSQL_TARGET_MB + TOTAL_MEM / 10 ))
+    local worst=$(( MYSQL_OTHER_MB + pool + (MYSQL_REC_MAX_CONN * per_thread_b) / MB ))
+    if (( worst > allowed )) && [[ -n "$MYSQL_MAX_USED" ]]; then
+        local fit=$(( (allowed - MYSQL_OTHER_MB - pool) * MB / per_thread_b ))
+        (( fit < need )) && fit=$need
+        (( fit < MYSQL_REC_MAX_CONN )) && MYSQL_REC_MAX_CONN=$fit
+    fi
+
+    MYSQL_REC_FOOTPRINT_MB=$(( MYSQL_OTHER_MB + pool + conn_mb ))
+    MYSQL_REC_PEAK_MB=$(( MYSQL_OTHER_MB + pool + (MYSQL_REC_MAX_CONN * per_thread_b) / MB ))
+
+    # --- recommendations ---
+    if (( MYSQL_REC_BP_MB != MYSQL_BP_MB )); then
+        add_stack_rec "[MySQL] innodb_buffer_pool_size ${MYSQL_BP_MB}M => ${MYSQL_REC_BP_MB}M (${pool_note})."
+    fi
+    if (( MYSQL_REC_MAX_CONN != MYSQL_MAX_CONN )); then
+        if (( MYSQL_REC_MAX_CONN > MYSQL_MAX_CONN )); then
+            add_stack_rec "[MySQL] max_connections ${MYSQL_MAX_CONN} => ${MYSQL_REC_MAX_CONN}: Max_used_connections (${MYSQL_MAX_USED}) reached 90%+ of the limit."
+        else
+            add_stack_rec "[MySQL] max_connections ${MYSQL_MAX_CONN} => ${MYSQL_REC_MAX_CONN}: at ${MYSQL_PER_THREAD_KB} KB/connection the current limit could use more RAM than planned (peak used: ${MYSQL_MAX_USED})."
+        fi
+    fi
+    if [[ "${MYV[query_cache_type]:-OFF}" =~ ^(ON|1|DEMAND|2)$ ]] && (( qc_b > 0 )); then
+        MYSQL_QUERY_CACHE_ON=1
+        add_stack_rec "[MySQL] Query cache is enabled ($(bytes_to_mb "$qc_b") MB); set query_cache_type = 0 and query_cache_size = 0 to avoid global mutex contention."
+    fi
+    if (( tmp_b != heap_b )); then
+        add_stack_rec "[MySQL] tmp_table_size (${MYSQL_TMP_MB}M) and max_heap_table_size (${MYSQL_HEAP_MB}M) differ; the smaller one wins, so set both to the same value."
+    fi
+    if [[ -n "$MYSQL_UPTIME" ]] && (( MYSQL_UPTIME < 86400 )); then
+        add_stack_rec "[MySQL] Server uptime is under 24h; Max_used_connections may understate real peak load. Re-run after a full day."
+    fi
+    if (( MYSQL_PEAK_MB > TOTAL_MEM )); then
+        add_stack_rec "[MySQL] Current worst-case memory (${MYSQL_PEAK_MB} MB with all ${MYSQL_MAX_CONN} connections busy) exceeds total RAM (${TOTAL_MEM} MB)."
+    fi
+    if [[ "$MYSQL_VARS_SOURCE" == "config" ]]; then
+        add_stack_rec "[MySQL] Live variables unavailable (sized from my.cnf + server defaults). Run as root or provide ~/.my.cnf credentials for live values."
+    fi
+}
+
+# Build the shared RAM plan before Apache sizing. Lowers APACHE_BUDGET_MB (never
+# raises it) when OS reserve + MySQL + PHP-FPM leave less than the tier share.
+compute_stack_plan() {
+    STACK_RECS=()
+    APACHE_TIER_BUDGET_MB=$APACHE_BUDGET_MB
+    set_stack_shares
+    detect_php_handlers
+    detect_phpfpm
+    detect_mysql
+    recommend_mysql
+
+    MYSQL_RESERVE_MB=0
+    if [[ "$MYSQL_RUNNING" -eq 1 ]]; then
+        MYSQL_RESERVE_MB=$MYSQL_RSS_MB
+        (( MYSQL_REC_FOOTPRINT_MB > MYSQL_RESERVE_MB )) && MYSQL_RESERVE_MB=$MYSQL_REC_FOOTPRINT_MB
+    fi
+
+    WEB_BUDGET_MB=$(( TOTAL_MEM - OS_RESERVE_MB - MYSQL_RESERVE_MB ))
+    (( WEB_BUDGET_MB < 0 )) && WEB_BUDGET_MB=0
+
+    # With PHP in FPM, httpd children no longer carry PHP, so Apache needs only a
+    # slice of the web budget. With mod_php loaded, PHP still lives in httpd.
+    APACHE_WEB_SHARE="1.00"
+    if [[ "$FPM_ACTIVE" -eq 1 ]] && ! has_php_handler "mod_php"; then
+        APACHE_WEB_SHARE="$APACHE_WEB_SHARE_WITH_FPM"
+    fi
+
+    local plan_apache
+    plan_apache=$(awk -v w="$WEB_BUDGET_MB" -v s="$APACHE_WEB_SHARE" 'BEGIN { printf "%.0f", w * s }')
+
+    if [[ -z "$BUDGET_OVERRIDE" ]] && (( plan_apache < APACHE_BUDGET_MB )); then
+        APACHE_BUDGET_MB=$plan_apache
+        BUDGET_SOURCE="shared-plan"
+        APACHE_PCT=$(awk -v b="$APACHE_BUDGET_MB" -v t="$TOTAL_MEM" 'BEGIN { printf "%.2f", b / t }')
+    fi
+}
+
+# After the Apache block is built: give PHP-FPM what is left and size pools.
+finalize_stack_plan() {
+    if [[ "$MPM_TYPE" == "prefork" ]]; then
+        APACHE_USED_MB=$(( MAX_WORKERS * AVG_PROC_MB ))
+    else
+        local procs=$(( (MAX_WORKERS + THREADS_PER_CHILD - 1) / THREADS_PER_CHILD ))
+        APACHE_USED_MB=$(( procs * AVG_PROC_MB ))
+    fi
+
+    PLAN_OVERCOMMIT_MB=$(( OS_RESERVE_MB + MYSQL_RESERVE_MB + APACHE_USED_MB - TOTAL_MEM ))
+    (( PLAN_OVERCOMMIT_MB < 0 )) && PLAN_OVERCOMMIT_MB=0
+    if (( PLAN_OVERCOMMIT_MB > 0 )); then
+        add_stack_rec "[PLAN] OS reserve + MySQL + Apache worst case exceed RAM by ${PLAN_OVERCOMMIT_MB} MB (Apache floors/caps are fixed by tier). Consider more RAM or a smaller MySQL share."
+    fi
+
+    FPM_BUDGET_MB=0
+    FPM_CAPACITY=0
+    FPM_REC_MAX_CHILDREN=0
+    FPM_OVERCOMMIT=1
+
+    if [[ "$FPM_STATUS" == "configured_not_running" ]]; then
+        add_stack_rec "[FPM] ${FPM_POOL_COUNT} pool file(s) found but no php-fpm master is running; FPM is not counted in the plan."
+    fi
+    if [[ "$FPM_ACTIVE" -ne 1 ]]; then
+        if has_php_handler "suphp" || has_php_handler "lsapi"; then
+            add_stack_rec "[PLAN] PHP runs outside httpd via $(has_php_handler lsapi && echo lsapi || echo suphp/CGI); those processes are not sized here, which is why the Apache share stays at the tier limit."
+        fi
+        return
+    fi
+
+    FPM_BUDGET_MB=$(( WEB_BUDGET_MB - APACHE_USED_MB ))
+    if (( FPM_BUDGET_MB <= 0 )); then
+        FPM_BUDGET_MB=0
+        add_stack_rec "[FPM] No RAM left for PHP-FPM after OS, MySQL and Apache; PHP workers will push the server into swap under load."
+        return
+    fi
+    FPM_CAPACITY=$(( FPM_BUDGET_MB / FPM_AVG_MB ))
+
+    local mysql_excess=$(( MYSQL_RSS_MB - MYSQL_REC_FOOTPRINT_MB ))
+    if (( MYSQL_REC_FOOTPRINT_MB > 0 && mysql_excess * 10 > MYSQL_RSS_MB )); then
+        add_stack_rec "[PLAN] MySQL currently holds ${MYSQL_RSS_MB} MB; with the MySQL changes above it would need ~${MYSQL_REC_FOOTPRINT_MB} MB, freeing ~${mysql_excess} MB for PHP-FPM. Re-run after changing MySQL before raising FPM limits."
+    fi
+
+    # Per-pool pm.max_children. Idle ondemand pools hold no workers, so when most
+    # pools are ondemand allow 3x overcommit across pools; otherwise none.
+    if (( FPM_POOL_COUNT > 0 && FPM_MODE_ONDEMAND * 2 > FPM_POOL_COUNT )); then
+        FPM_OVERCOMMIT=3
+    fi
+    if (( FPM_POOL_COUNT <= 1 )); then
+        FPM_REC_MAX_CHILDREN=$FPM_CAPACITY
+    else
+        FPM_REC_MAX_CHILDREN=$(( FPM_CAPACITY * FPM_OVERCOMMIT / FPM_POOL_COUNT ))
+    fi
+    (( FPM_REC_MAX_CHILDREN < 5 )) && FPM_REC_MAX_CHILDREN=5
+    (( FPM_REC_MAX_CHILDREN > FPM_CAPACITY )) && FPM_REC_MAX_CHILDREN=$FPM_CAPACITY
+    (( FPM_REC_MAX_CHILDREN < 1 )) && FPM_REC_MAX_CHILDREN=1
+
+    if (( FPM_TYPICAL_MAX_CHILDREN > 0 && FPM_TYPICAL_MAX_CHILDREN != FPM_REC_MAX_CHILDREN )); then
+        local where="each pool"
+        if [[ "${IS_CPANEL:-0}" -eq 1 ]]; then
+            where="WHM > MultiPHP Manager > System PHP-FPM Settings (pm_max_children in /var/cpanel/ApachePHPFPM/system_pool_defaults.yaml), then /scripts/php_fpm_config --rebuild; per-domain overrides in /var/cpanel/userdata/*/*.php_fpm.yaml still win"
+        fi
+        add_stack_rec "[FPM] pm.max_children ${FPM_TYPICAL_MAX_CHILDREN} => ${FPM_REC_MAX_CHILDREN} (RAM for ~${FPM_CAPACITY} workers at ${FPM_AVG_MB} MB across ${FPM_POOL_COUNT} pools, ${FPM_OVERCOMMIT}x overcommit). Set in ${where}."
+    fi
+
+    local worst_mb=$(( FPM_SUM_MAX_CHILDREN * FPM_AVG_MB ))
+    if (( FPM_SUM_MAX_CHILDREN > FPM_CAPACITY * FPM_OVERCOMMIT )); then
+        add_stack_rec "[FPM] Sum of pm.max_children is ${FPM_SUM_MAX_CHILDREN} (~${worst_mb} MB) vs. a budget of ${FPM_BUDGET_MB} MB (~${FPM_CAPACITY} workers). Simultaneous load across pools can exhaust RAM."
+    fi
+
+    local i big=()
+    for (( i = 0; i < ${#FPM_POOL_NAMES[@]}; i++ )); do
+        (( FPM_POOL_MAX[i] > FPM_CAPACITY )) && big+=("${FPM_POOL_NAMES[i]}(${FPM_POOL_MAX[i]})")
+    done
+    if (( ${#big[@]} > 0 )); then
+        add_stack_rec "[FPM] ${#big[@]} pool(s) allow more children than the whole FPM budget can hold (~${FPM_CAPACITY}): ${big[*]:0:5}$( (( ${#big[@]} > 5 )) && echo ' ...')."
+    fi
+
+    if (( FPM_LOG_HITS > 0 )); then
+        local top
+        top=$(for p in "${!FPM_POOL_HITS[@]}"; do printf '%s %s\n' "${FPM_POOL_HITS[$p]}" "$p"; done \
+                | sort -rn | head -5 | awk '{ printf "%s%s(%s)", sep, $2, $1; sep=", " }')
+        add_stack_rec "[FPM] ${FPM_LOG_HITS} 'reached pm.max_children' warnings in recent logs across ${#FPM_POOL_HITS[@]} pool(s): ${top}. Raise those pools individually (ceiling ~${FPM_CAPACITY}) before raising the default."
+    fi
+
+    if (( FPM_NO_MAX_REQUESTS > 0 )); then
+        add_stack_rec "[FPM] ${FPM_NO_MAX_REQUESTS} pool(s) have pm.max_requests = 0 (workers never recycle); set pm.max_requests = 500 to contain memory leaks."
+    fi
+
+    if (( FPM_POOL_COUNT >= 20 && FPM_MODE_DYNAMIC + FPM_MODE_STATIC > FPM_POOL_COUNT / 4 )); then
+        add_stack_rec "[FPM] $(( FPM_MODE_DYNAMIC + FPM_MODE_STATIC )) of ${FPM_POOL_COUNT} pools use dynamic/static; on a multi-tenant box pm = ondemand keeps idle sites from holding workers."
+    fi
+}
+
+stack_handlers_csv() {
+    local IFS=,
+    if (( ${#PHP_HANDLERS[@]} > 0 )); then
+        echo "${PHP_HANDLERS[*]}"
+    else
+        echo "none"
+    fi
+}
+
+fpm_status_text() {
+    case "$FPM_STATUS" in
+        running) echo "running (${FPM_MASTERS} master(s), ${FPM_WORKERS_NOW} worker(s) now)" ;;
+        configured_not_running) echo "pool files found, no master running" ;;
+        not_detected) echo "not detected" ;;
+        *) echo "$FPM_STATUS" ;;
+    esac
+}
+
+mysql_status_text() {
+    case "$MYSQL_STATUS" in
+        running)
+            if [[ "$MYSQL_VERSION" == "unknown" ]]; then
+                echo "running (variables: ${MYSQL_VARS_SOURCE})"
+            else
+                echo "running ${MYSQL_FLAVOR} ${MYSQL_VERSION} (variables: ${MYSQL_VARS_SOURCE})"
+            fi
+            ;;
+        running_no_access) echo "running, but variables unreadable (run as root or add ~/.my.cnf)" ;;
+        installed_not_running) echo "installed, not running" ;;
+        absent) echo "not detected" ;;
+        *) echo "$MYSQL_STATUS" ;;
+    esac
+}
+
+print_stack_report() {
+    echo "------------------------------------------------"
+    echo " Server memory plan (shared by Apache, PHP-FPM, MySQL)"
+    echo "------------------------------------------------"
+    printf "  %-24s %8s MB\n" "Total RAM" "$TOTAL_MEM"
+    printf "  %-24s %8s MB  (%s)\n" "OS / page cache reserve" "$OS_RESERVE_MB" "$OS_RESERVE_PCT of RAM, 512-4096 MB"
+    if [[ "$MYSQL_RUNNING" -eq 1 ]]; then
+        printf "  %-24s %8s MB  (%s)\n" "MySQL/MariaDB" "$MYSQL_RESERVE_MB" "max of current RSS ${MYSQL_RSS_MB} MB and recommended ${MYSQL_REC_FOOTPRINT_MB} MB"
+    else
+        printf "  %-24s %8s\n" "MySQL/MariaDB" "not running"
+    fi
+    printf "  %-24s %8s MB  (%s)\n" "Apache (worst case)" "$APACHE_USED_MB" "budget ${APACHE_BUDGET_MB} MB; tier budget ${APACHE_TIER_BUDGET_MB} MB; web share ${APACHE_WEB_SHARE}"
+    if [[ "$FPM_ACTIVE" -eq 1 ]]; then
+        printf "  %-24s %8s MB  (%s)\n" "PHP-FPM" "$FPM_BUDGET_MB" "~${FPM_CAPACITY} workers at ${FPM_AVG_MB} MB (${FPM_MEM_METHOD})"
+    else
+        printf "  %-24s %8s\n" "PHP-FPM" "n/a"
+    fi
+    (( PLAN_OVERCOMMIT_MB > 0 )) && printf "  %-24s %8s MB\n" "OVERCOMMITTED BY" "$PLAN_OVERCOMMIT_MB"
+
+    echo "------------------------------------------------"
+    echo " PHP-FPM (recommend-only; not applied)"
+    echo "------------------------------------------------"
+    echo "  Status:                 $(fpm_status_text)"
+    echo "  Apache PHP modules:     $(stack_handlers_csv)"
+    [[ -n "$CPANEL_PHP_HANDLERS" ]] && echo "  cPanel handlers:        $CPANEL_PHP_HANDLERS"
+    if (( FPM_POOL_COUNT > 0 )); then
+        echo "  Pools:                  ${FPM_POOL_COUNT} (ondemand ${FPM_MODE_ONDEMAND}, dynamic ${FPM_MODE_DYNAMIC}, static ${FPM_MODE_STATIC})"
+        echo "  Sum of pm.max_children: ${FPM_SUM_MAX_CHILDREN}"
+        echo "  max_children warnings:  ${FPM_LOG_HITS} (in ${FPM_LOG_FILES_SCANNED} log file(s))"
+        if [[ "$FPM_ACTIVE" -eq 1 ]]; then
+            print_current_vs_proposed "pm.max_children" "${FPM_TYPICAL_MAX_CHILDREN} (typical)" "$FPM_REC_MAX_CHILDREN"
+        fi
+    fi
+
+    echo "------------------------------------------------"
+    echo " MySQL/MariaDB (recommend-only; not applied)"
+    echo "------------------------------------------------"
+    echo "  Status:                 $(mysql_status_text)"
+    if [[ "$MYSQL_RUNNING" -eq 1 && "$MYSQL_VARS_SOURCE" != "none" ]]; then
+        echo "  Planned share:          ${MYSQL_SHARE} of RAM = ${MYSQL_TARGET_MB} MB (source: ${MYSQL_SHARE_SOURCE})"
+        echo "  InnoDB data+index:      $( (( MYSQL_INNODB_DATA_MB > 0 )) && echo "${MYSQL_INNODB_DATA_MB} MB" || echo "unknown")"
+        echo "  Per-connection buffers: ${MYSQL_PER_THREAD_KB} KB; peak connections used: ${MYSQL_MAX_USED:-unknown}"
+        echo "  Worst case now:         ${MYSQL_PEAK_MB} MB => ${MYSQL_REC_PEAK_MB} MB"
+        print_current_vs_proposed "innodb_buffer_pool_size" "${MYSQL_BP_MB}M" "${MYSQL_REC_BP_MB}M"
+        print_current_vs_proposed "max_connections" "$MYSQL_MAX_CONN" "$MYSQL_REC_MAX_CONN"
+        if (( MYSQL_REC_BP_MB != MYSQL_BP_MB || MYSQL_REC_MAX_CONN != MYSQL_MAX_CONN )); then
+            echo
+            echo "  # Suggested [mysqld] settings (not applied). innodb_buffer_pool_size can be"
+            echo "  # changed live with SET GLOBAL on MySQL 5.7+/MariaDB 10.2+; persist it in my.cnf."
+            echo "  [mysqld]"
+            (( MYSQL_REC_BP_MB != MYSQL_BP_MB )) && echo "  innodb_buffer_pool_size = ${MYSQL_REC_BP_MB}M"
+            (( MYSQL_REC_MAX_CONN != MYSQL_MAX_CONN )) && echo "  max_connections = ${MYSQL_REC_MAX_CONN}"
+        fi
+    fi
+
+    echo "------------------------------------------------"
+    echo " Stack recommendations"
+    echo "------------------------------------------------"
+    if (( ${#STACK_RECS[@]} == 0 )); then
+        echo "  [OK] No PHP-FPM or MySQL changes recommended."
+    else
+        local r
+        for r in "${STACK_RECS[@]}"; do
+            echo "  - $r"
+        done
+    fi
+}
+
+build_stack_json() {
+    local recs="" r sep=""
+    if (( ${#STACK_RECS[@]} > 0 )); then
+        for r in "${STACK_RECS[@]}"; do
+            recs+="${sep}\"$(json_escape "$r")\""
+            sep=", "
+        done
+    fi
+    local hits="" p
+    sep=""
+    if (( ${#FPM_POOL_HITS[@]} > 0 )); then
+        for p in "${!FPM_POOL_HITS[@]}"; do
+            hits+="${sep}\"$(json_escape "$p")\": ${FPM_POOL_HITS[$p]}"
+            sep=", "
+        done
+    fi
+    local handlers="" h
+    sep=""
+    if (( ${#PHP_HANDLERS[@]} > 0 )); then
+        for h in "${PHP_HANDLERS[@]}"; do
+            handlers+="${sep}\"${h}\""
+            sep=", "
+        done
+    fi
+    local max_used="${MYSQL_MAX_USED:-null}"
+
+    cat <<EOF
+  "stack_enabled": $(json_bool "$STACK_ENABLED"),
+  "memory_plan": {
+    "os_reserve_mb": $OS_RESERVE_MB,
+    "mysql_reserve_mb": $MYSQL_RESERVE_MB,
+    "web_budget_mb": $WEB_BUDGET_MB,
+    "apache_tier_budget_mb": $APACHE_TIER_BUDGET_MB,
+    "apache_web_share": $APACHE_WEB_SHARE,
+    "apache_worst_case_mb": $APACHE_USED_MB,
+    "php_fpm_budget_mb": $FPM_BUDGET_MB,
+    "overcommit_mb": $PLAN_OVERCOMMIT_MB
+  },
+  "php_fpm": {
+    "status": "$FPM_STATUS",
+    "apache_php_modules": [${handlers}],
+    "cpanel_handlers": "$(json_escape "$CPANEL_PHP_HANDLERS")",
+    "masters": $FPM_MASTERS,
+    "workers_now": $FPM_WORKERS_NOW,
+    "avg_worker_mb": $FPM_AVG_MB,
+    "memory_method": "$FPM_MEM_METHOD",
+    "pools": $FPM_POOL_COUNT,
+    "pools_ondemand": $FPM_MODE_ONDEMAND,
+    "pools_dynamic": $FPM_MODE_DYNAMIC,
+    "pools_static": $FPM_MODE_STATIC,
+    "pools_without_max_requests": $FPM_NO_MAX_REQUESTS,
+    "sum_max_children": $FPM_SUM_MAX_CHILDREN,
+    "typical_max_children": $FPM_TYPICAL_MAX_CHILDREN,
+    "capacity_workers": $FPM_CAPACITY,
+    "overcommit_factor": $FPM_OVERCOMMIT,
+    "recommended_max_children": $FPM_REC_MAX_CHILDREN,
+    "max_children_warnings": $FPM_LOG_HITS,
+    "max_children_warnings_by_pool": {${hits}}
+  },
+  "mysql": {
+    "status": "$MYSQL_STATUS",
+    "flavor": "$MYSQL_FLAVOR",
+    "version": "$(json_escape "$MYSQL_VERSION")",
+    "variables_source": "$MYSQL_VARS_SOURCE",
+    "rss_mb": $MYSQL_RSS_MB,
+    "planned_share": $MYSQL_SHARE,
+    "planned_share_source": "$MYSQL_SHARE_SOURCE",
+    "target_mb": $MYSQL_TARGET_MB,
+    "innodb_data_mb": $MYSQL_INNODB_DATA_MB,
+    "per_connection_kb": $MYSQL_PER_THREAD_KB,
+    "max_used_connections": $max_used,
+    "worst_case_mb": $MYSQL_PEAK_MB,
+    "recommended_worst_case_mb": $MYSQL_REC_PEAK_MB,
+    "current": {
+      "innodb_buffer_pool_size_mb": $MYSQL_BP_MB,
+      "max_connections": $MYSQL_MAX_CONN
+    },
+    "recommended": {
+      "innodb_buffer_pool_size_mb": $MYSQL_REC_BP_MB,
+      "max_connections": $MYSQL_REC_MAX_CONN
+    }
+  },
+  "stack_recommendations": [${recs}],
+EOF
+}
+
+append_stack_batch_fields() {
+    fields+=("stack_enabled=$STACK_ENABLED")
+    fields+=("os_reserve_mb=$OS_RESERVE_MB")
+    fields+=("mysql_reserve_mb=$MYSQL_RESERVE_MB")
+    fields+=("web_budget_mb=$WEB_BUDGET_MB")
+    fields+=("apache_tier_budget_mb=$APACHE_TIER_BUDGET_MB")
+    fields+=("apache_worst_case_mb=$APACHE_USED_MB")
+    fields+=("plan_overcommit_mb=$PLAN_OVERCOMMIT_MB")
+    fields+=("php_modules=$(stack_handlers_csv)")
+    fields+=("fpm_status=$FPM_STATUS")
+    fields+=("fpm_pools=$FPM_POOL_COUNT")
+    fields+=("fpm_workers_now=$FPM_WORKERS_NOW")
+    fields+=("fpm_avg_worker_mb=$FPM_AVG_MB")
+    fields+=("fpm_sum_max_children=$FPM_SUM_MAX_CHILDREN")
+    fields+=("fpm_budget_mb=$FPM_BUDGET_MB")
+    fields+=("fpm_capacity=$FPM_CAPACITY")
+    fields+=("fpm_current_max_children=$FPM_TYPICAL_MAX_CHILDREN")
+    fields+=("fpm_recommended_max_children=$FPM_REC_MAX_CHILDREN")
+    fields+=("fpm_max_children_warnings=$FPM_LOG_HITS")
+    fields+=("mysql_status=$MYSQL_STATUS")
+    fields+=("mysql_rss_mb=$MYSQL_RSS_MB")
+    fields+=("mysql_buffer_pool_mb=$MYSQL_BP_MB")
+    fields+=("mysql_recommended_buffer_pool_mb=$MYSQL_REC_BP_MB")
+    fields+=("mysql_max_connections=$MYSQL_MAX_CONN")
+    fields+=("mysql_recommended_max_connections=$MYSQL_REC_MAX_CONN")
+    fields+=("mysql_max_used_connections=${MYSQL_MAX_USED:-unknown}")
+    fields+=("mysql_worst_case_mb=$MYSQL_PEAK_MB")
+    fields+=("stack_recommendations=${#STACK_RECS[@]}")
+}
+
 apache_configtest() {
     if [[ -z "${APACHE_CONFIGTEST_CMD:-}" ]]; then
         detect_configtest_cmd
@@ -1000,10 +1991,14 @@ normalize_block_for_compare() {
 run_analysis_pipeline() {
     set_tier_params
     measure_apache_procs
+    APACHE_TIER_BUDGET_MB=$APACHE_BUDGET_MB
+    [[ "$STACK_ENABLED" -eq 1 ]] && compute_stack_plan
     get_current_values_with_precedence
     analyze_error_log
     detect_configtest_cmd
     build_recommended_block
+    [[ "$STACK_ENABLED" -eq 1 ]] && finalize_stack_plan
+    return 0
 }
 
 build_json_output() {
@@ -1025,6 +2020,7 @@ build_json_output() {
   "apache_budget_mb": $APACHE_BUDGET_MB,
   "apache_budget_pct": $APACHE_PCT,
   "apache_budget_source": "$BUDGET_SOURCE",
+$(build_stack_json)
   "log_file": "$(sanitize_value "${LOG_FILE:-}")",
   "export_path": "$(sanitize_value "${EXPORT_PATH:-}")",
   "recommended_block": "$block_json",
@@ -1134,6 +2130,7 @@ build_batch_output() {
     fields+=("recommended_max_requestworkers=$(format_batch_value "$MAX_WORKERS" "unknown")")
     fields+=("recommended_start_servers=$(format_batch_value "$START_SERVERS_ROUNDED" "unknown")")
     fields+=("recommended_max_connections_per_child=$(format_batch_value "$MAX_CONN_PER_CHILD" "unknown")")
+    append_stack_batch_fields
 
     printf "%s\n" "${fields[*]}"
 }
@@ -1674,7 +2671,7 @@ if [[ "$MODE" == "locate" ]]; then
     exit 0
 fi
 
-start_progress_indicator "Collecting Apache metrics and log data"
+start_progress_indicator "Collecting Apache, PHP-FPM and MySQL metrics"
 run_analysis_pipeline
 stop_progress_indicator
 
@@ -1727,6 +2724,9 @@ else
 
     echo "------------------------------------------------"
     echo -e "$RECOMMENDED_BLOCK"
+    if [[ "$STACK_ENABLED" -eq 1 ]]; then
+        print_stack_report
+    fi
     echo "------------------------------------------------"
 fi
 
